@@ -1,0 +1,215 @@
+---
+title: "Sieci Bayesowskie"
+author: "Paweł Drozd"
+date: "Styczeń, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Czym są sieci bayesowskie? 
+
+Za [wikipedią](https://en.wikipedia.org/wiki/Bayesian_network):
+
+>A Bayesian network (...) is a probabilistic **graphical model** (a type of 
+statistical model) that represents a set of variables and their **conditional dependencies** via a **directed acyclic graph (DAG)**.
+
+Teraz rozłóżymy tę definicję na mniejsze części:
+
+* graphical model: oznacza tyle, że model będzie w postaci grafu
+* DAG: graf (model) nie może być dowolny. Musi być skierowany i acykliczy
+![skierowany acykliczny graf](dag.jpg)
+* conditional dependencies: sedno modelu. Wierzchołki grafu odpowiadają zmienny,
+krawędzie reprezentują warunkowe zleżności między zmiennymi.
+
+
+### Do czego mogą służyć?
+
+1. Ustalenie zależności między zmiennym.
+2. Wizualizacja tych zależności.
+3. Wnoskowanie na temat obserwaji.
+4. Uzupełnianie danych.
+
+
+### Jak zbudować?
+
+
+Skoro mniej więcej wiemy czym są te modele, stwórzmy jakiś. Wykorzystamy dane na 
+temat tego jak wybrane charakterystyki krwi zmieniają się wraz z płcią i sportem
+uprawianym przez zawodników. Ogarniczymy się do 6 zmiennych:
+
+* płeć
+* sport
+* pcBfat - procent tkanki tłuszczowej
+* hg - stężenie hemoglobiny
+* rcc - liczba czerwonych krwinek
+* hc - procentowy hematokryt
+
+
+```{r, message=F}
+library(bnlearn)
+library(tidyverse)
+library(visNetwork)
+library(DAAG)
+
+data('ais')
+
+ais_sub <- ais %>% 
+  select(sex, sport, pcBfat, hg, rcc, hc)
+
+skimr::skim(ais_sub) %>% skimr::kable()
+```
+
+```{r wizualizacja, echo=F}
+plot_network <- function(structure, ht = "400px"){
+  nodes.uniq <- unique(c(structure$arcs[,1], structure$arcs[,2]))
+  nodes <- data.frame(id = nodes.uniq,
+                      label = nodes.uniq,
+                      color = "darkturquoise",
+                      shadow = TRUE)
+  
+  edges <- data.frame(from = structure$arcs[,1],
+                      to = structure$arcs[,2],
+                      arrows = "to",
+                      smooth = TRUE,
+                      shadow = TRUE,
+                      color = "black")
+  
+  return(visNetwork(nodes, edges, height = ht, width = "100%"))
+}
+```
+
+
+Tworzenie modelu odbyć się może na dwa sposoby. W pierwszym samodzielnie 
+definiujemy zależności między zmiennymi. Drugie podejście pozwala na 
+automatyczne określenie struktury grafu.
+
+
+Przykład samodzielnego definiowania.
+
+```{r}
+bn_struktura <- model2network("[sex][sport|sex][hg|sex][pcBfat|hg:sex:sport][hc|hg][rcc|hc]")
+
+bn_struktura
+```
+
+```{r}
+plot_network(bn_struktura)
+```
+
+
+Drugim podejściem jest pozostawienie stworzenia grafu algorytmowi. Jeśli chcemy
+możemy w ten proces do pewnego stopnia ingerować, definiując krawędzie, które 
+muszą lub nie mogą się pojawić. 
+
+```{r}
+bn_struktura <- hc(ais_sub, score = "bic-cg")
+
+plot_network(bn_struktura)
+```
+
+
+W dalszej części, będziemy posługiwać się modelem stworzonym automatycznie.
+Kolejnym krokiem jest estymacji warunkowych rozkładów poszczególych zmiennych.
+
+```{r}
+bn_model <- bn.fit(bn_struktura, ais_sub)
+```
+
+Właściwie, to model jest gotowy do użycia :) Co można z nim zrobić poza
+narysowaniem ładnych grafów? Po pierwsze odpytać.
+
+Być może interesuje nas jakie jest prawdopodobieństo, że mężczyzna uprawijący
+pływanie będzie miał ponad 10% tkanki tłuszczowej?
+
+```{r}
+cat("P(pcBfat > 10 | mężczyzna i pływa) =", cpquery(bn_model, (pcBfat > 10), (sport == "Swim" & sex == 'm')))
+```
+
+Zapytania mnie muszą być formułowanie wyłącznie w kierunku krawędzi grafu.
+
+```{r}
+cat("P(kobieta | gra w koszykówkę i hg > 10) =", cpquery(bn_model, (sex == 'f'), (sport == "B_Ball" & hg > 10)))
+```
+
+Możemy też pomijać, niektóre wierzchołki (zmienne).
+
+```{r}
+cat("P(sprint | hc > 16 i pcBfat > 7) =", cpquery(bn_model, (sport == 'T_Sprnt'), (hc > 16 & pcBfat > 7)))
+```
+
+
+Co dalej? W zaproszeniu napisałem o uzupełnianiu danych. Skoro znamy rozkłady
+warunkowe poszczególnych zmiennych, wydaje się, że uzyskanie wartości dla kilku
+pustych zmiennych nie powinno być problemem. Dokładnie tak jest.
+
+
+```{r}
+ais_miss <- ais_sub
+miss_id <- sample(1:nrow(ais_sub), 50)
+ais_miss[miss_id, c("hg", "hc")] <- NA
+
+
+ais_imp <- impute(bn_model, data = ais_miss, method = "bayes-lw")
+
+ais_comb <- ais_sub %>% 
+  slice(miss_id) %>% 
+  mutate(set = 'orig') %>% 
+  bind_rows(ais_imp %>% 
+            slice(miss_id) %>% 
+              mutate(set = 'uzupełnione'))
+
+
+ggplot(ais_comb) +
+  geom_point(aes(x = hg, y = hc), alpha = 0.7, size = 0.5) +
+  facet_grid(cols = vars(set))
+
+
+```
+
+
+Oczywiście, można uzupełnić więcej niż dwie zmienne. W związku z tym zasadne
+wydaje się pytanie ile minimalnie wartości musi być znane, aby to uzupełnianie 
+dało się wykonać?
+
+Odpowiedzą jest: 0. Po wytrenowaniu modelu, kiedy znane znane są probabilistyczne
+zależności między zmiennymi, możemy symulować całe zbiory danych.
+
+```{r}
+ais_sim <- rbn(bn_model, 202)
+
+ais_comb <- ais_sub %>% 
+  mutate(set = 'orig') %>% 
+  bind_rows(ais_sim %>% 
+              mutate(set = 'sim')) %>% 
+  mutate(set = as.factor(set))
+```
+```{r, echo=F}
+
+p1 <- ggplot(ais_comb) + geom_bar(aes(x=sex, y =(..count..)/sum(..count..), fill=set), position = 'dodge') +theme(legend.position = "bottom")+ylab('%')
+p2 <- ggplot(ais_comb) + geom_bar(aes(x=sport, y =(..count..)/sum(..count..), fill=set), position = 'dodge')+theme(legend.position = "bottom") + ylab('%')
+p3 <- ggplot(ais_comb) + geom_density(aes(x=pcBfat, fill=set), alpha = .6)+theme(legend.position = "bottom")
+p4 <- ggplot(ais_comb) + geom_density(aes(x=hg, fill=set), alpha = .6)+theme(legend.position = "bottom")
+p5 <- ggplot(ais_comb) + geom_density(aes(x=rcc, fill=set), alpha = .6)+theme(legend.position = "bottom")
+p6 <- ggplot(ais_comb) + geom_density(aes(x=hc, fill=set), alpha = .6)+theme(legend.position = "bottom")
+
+gridExtra::grid.arrange(p1,p2,p3,p4,p5,p6, ncol=3)
+```
+
+
+Nie wygląda to najgorzej :)
+
+### Źródła
+
+1. [Strona paczki implementującej sieci](https://www.bnlearn.com/)
+2. "Bayesian Networks in R with Applications in Systems Biology", R. Nagarajan, M. Scutari and S. Lèbre (2013).
+
+
+
+
+
+
+
+
